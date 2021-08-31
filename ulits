@@ -1,0 +1,181 @@
+import gc
+import os
+import sys
+import numpy as np
+import torch
+from PIL import Image
+import random
+import copy
+import torch.nn as nn
+import math
+from skimage.measure.simple_metrics import compare_psnr
+from skimage.measure import compare_ssim
+# from tensorflow_core.python.keras.backend import random_normal
+from numpy.linalg import norm
+def weights_init_kaiming(m):
+    classname = m.__class__.__name__
+    if classname.find('Conv') != -1:
+        nn.init.kaiming_normal(m.weight.data, a=0, mode='fan_in')
+    elif classname.find('Linear') != -1:
+        nn.init.kaiming_normal(m.weight.data, a=0, mode='fan_in')
+    elif classname.find('BatchNorm') != -1:
+        # nn.init.uniform(m.weight.data, 1.0, 0.02)
+        m.weight.data.normal_(mean=0, std=math.sqrt(2./9./64.)).clamp_(-0.025,0.025)
+        nn.init.constant(m.bias.data, 0.0)
+
+def add_periostripenoise(img,sigma):
+    noise_img = copy.deepcopy(img)
+    Location = 10
+    height,width,band =noise_img.shape[3],noise_img.shape[2],noise_img.shape[1]
+    # Location = torch.randperm(width)
+    num = width#int(height*width*proportion)
+    # noise_img = np.zeros(shape=(band,height,width),dtype="float32")
+    noise_img = torch.zeros((band,height,width))
+    for j in range(band):
+        n = torch.randn((band, 1, width)) * sigma / 255
+        n = n.repeat(1, height, 1)#同一波段噪声水平相同，不同波段噪声水平不同
+        for i in range(num):
+            w = random.randint(0,width-1)
+            h = random.randint(0,height-1)
+            # b = int(band/2)+1
+            noise_img[j, :, i] = n[j, :, i]  # band,行，列
+    noise_img = noise_img.cuda()
+        # if random.randint(0,1) ==0:
+        #     noise_img[:,:,b,:,w] = 0
+        # else:
+        #     noise_img[:,:,b,:,w] = 1
+    return img+noise_img,noise_img
+
+
+def add_stripenoise(img,sigma):
+    noise_img = copy.deepcopy(img)
+    height, width, band = noise_img.shape[3], noise_img.shape[2], noise_img.shape[1]
+    Location = torch.randperm(width)
+    num = int(width * 0.3)  # int(height*width*proportion)
+    noise_img1 = np.zeros(shape=(band, height, width), dtype="float32")
+    noise_img2 = np.zeros(shape=(band, height, width), dtype="float32")
+    level = random.randint(1,20)
+    n1 = torch.randn(band, 1, height) * level / 255
+    n1 = n1.repeat(1, width, 1)
+    for i in range(num):
+        w = random.randint(0, width - 1)
+        h = random.randint(0, height - 1)
+        b = int(band / 2) + 1
+        # n = random.gauss(0, 0.0001)
+        noise_img1[:, :, w] = n1[:, :, w]
+    n2 = torch.randn(width, height) * level / 255
+    noise_img2[:, :, :] = n2[:, :]
+    noise_img1 = torch.tensor(noise_img1).cuda()
+    noise_img2 = torch.tensor(noise_img2).cuda()
+    # if random.randint(0,1) ==0:
+    #     noise_img[:,:,b,:,w] = 0
+    # else:
+    #     noise_img[:,:,b,:,w] = 1
+    return img + noise_img1 + noise_img2, noise_img1 + noise_img2
+
+def save_list_to_file(path, thelist):
+    with open(path, 'w') as f:
+        for item in thelist:
+            f.write("%s\n" % item)
+
+def save_image_tensor2pillow(input_tensor: torch.Tensor, filename):
+    """
+    将tensor保存为pillow
+    :param input_tensor: 要保存的tensor
+    :param filename: 保存的文件名
+    """
+    # assert (len(input_tensor.shape) == 4 and input_tensor.shape[0] == 1)
+    # 复制一份
+    input_tensor = input_tensor.clone().detach()
+    # 到cpu
+    input_tensor = input_tensor.to(torch.device('cpu'))
+    # 反归一化
+    # input_tensor = unnormalize(input_tensor)
+    # 去掉批次维度
+    input_tensor = input_tensor.squeeze()
+    # 从[0,1]转化为[0,255]，再从CHW转为HWC，最后转为numpy
+    input_tensor = input_tensor[0]
+    input_tensor = input_tensor.mul_(255).add_(0.5).clamp_(0, 255).type(torch.uint8).numpy()
+
+    # 转成pillow
+    im = Image.fromarray(input_tensor)
+    im.save(filename)
+
+def sam(x_true, x_pred):
+    """
+    :param x_true: 高光谱图像：格式：(H, W, C)
+    :param x_pred: 高光谱图像：格式：(H, W, C)
+    :return: 计算原始高光谱数据与重构高光谱数据的光谱角相似度
+    """
+    sam_rad = np.zeros(x_pred.shape[0, 1])
+    for x in range(x_true.shape[0]):
+        for y in range(x_true.shape[1]):
+            tmp_pred = x_pred[x, y].ravel()
+            tmp_true = x_true[x, y].ravel()
+            sam_rad[x, y] = np.arccos(tmp_pred / (norm(tmp_pred) * tmp_true / norm(tmp_true)))
+    sam_deg = sam_rad.mean() * 180 / np.pi
+    return sam_deg
+def cal_psnr(im1, im2):
+    mse = ((im1 - im2) ** 2).mean()
+    psnr = 10 * np.log10(255 ** 2 / mse)
+    return psnr
+
+def batch_PSNR(img, imclean, data_range):
+    Img = img.data.cpu().numpy().astype(np.float32)
+    Iclean = imclean.data.cpu().numpy().astype(np.float32)
+    PSNR = []
+    Band_PSNR = []
+    Batch_PSNR = []
+    for i in range(Img.shape[0]):
+        for j in range(Img.shape[1]):
+            PSNR.append(compare_psnr(Iclean[i,j,:,:], Img[i,j,:,:],data_range=1))
+        Band_PSNR.append(np.mean(PSNR))
+    Batch_PSNR.append(np.mean(Band_PSNR))
+    return (np.mean(Batch_PSNR))
+def batch_SSIM(img, imclean,multichannel):
+    Img = img.data.cpu().numpy().astype(np.float32)
+    Img = Img.transpose(0,2,3,1)
+    Iclean = imclean.data.cpu().numpy().astype(np.float32)
+    Iclean = Iclean.transpose(0,2,3,1)
+    SSIM = []
+    Band_SSIM = []
+    Batch_SSIM = []
+    for i in range(Img.shape[0]):
+        for j in range(Img.shape[3]):
+            SSIM.append(compare_ssim(Iclean[i,:,:,j], Img[i,:,:,j],multichannel=multichannel,data_range=1))
+        Band_SSIM.append(np.mean(SSIM))
+    Batch_SSIM.append(np.mean(Band_SSIM))
+    return (np.mean(Batch_SSIM))
+def batch_SAM(img, imclean):
+    """
+    :param x_true: 高光谱图像：格式：(H, W, C)
+    :param x_pred: 高光谱图像：格式：(H, W, C)
+    :return: 计算原始高光谱数据与重构高光谱数据的光谱角相似度
+    """
+    Img = img.data.cpu().numpy().astype(np.float32)
+    Img = Img.transpose(0,2,3,1)
+    Iclean = imclean.data.cpu().numpy().astype(np.float32)
+    Iclean = Iclean.transpose(0,2,3,1)
+    SAM = []
+    Band_SAM = []
+    Batch_SAM = []
+    for i in range(Img.shape[0]):
+        for j in range(Img.shape[3]):
+            SAM.append(sam(Iclean[i,:,:,j], Img[i,:,:,j]))
+        Band_SAM.append(np.mean(SAM))
+    Batch_SAM.append(np.mean(Band_SAM))
+    return (np.mean(Batch_SAM))
+def _tensor_size(t):
+    return t.size()[1]*t.size()[2]*t.size()[3]
+def TV_loss(est_noise):
+    h_x = est_noise.size()[2]
+    w_x = est_noise.size()[3]
+    count_h = _tensor_size(est_noise[:, :, 1:, :])
+    count_w = _tensor_size(est_noise[:, :, :, 1:])
+    h_tv = torch.pow((est_noise[:, :, 1:, :] - est_noise[:, :, :h_x - 1, :]), 2).sum()
+    w_tv = torch.pow((est_noise[:, :, :, 1:] - est_noise[:, :, :, :w_x - 1]), 2).sum()
+    tvloss = h_tv / count_h + w_tv / count_w
+
+    loss = tvloss
+
+    return loss
